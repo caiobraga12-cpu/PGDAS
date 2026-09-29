@@ -1,0 +1,415 @@
+---
+title: "Projeto Integrador"
+subtitle: "Previsão do Encerramento de Empresas"
+date: today
+lang: pt-BR
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-summary: "Exibir codigo R"
+    code-tools: true
+    embed-resources: true
+    smooth-scroll: true
+    fig-responsive: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  fig-width: 9
+  fig-height: 5
+  cache: true
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+# O arquivo R contem toda a modelagem. O chunk fica oculto no relatorio,
+# mas e executado para que tabelas, metricas e graficos sejam atualizados.
+source("projeto_integradorv3.R", local = knitr::knit_global())
+
+resultado_floresta <- resultados_modelos |>
+  filter(modelo == "Floresta aleatoria")
+
+resultado_xgboost <- resultados_modelos |>
+  filter(modelo == "XGBoost")
+```
+
+# Resumo executivo
+
+O objetivo deste projeto e desenvolver um modelo preditivo capaz de indicar se
+uma empresa deixará de operar em um período de até dois anos. O processamento
+dos dados foi realizado em Python e a modelagem foi desenvolvida em R.
+
+A questão central é saber se é possível identificar, com base nas características disponíveis da empresa, aquelas que deixarão de operar em até dois anos.
+
+Foram avaliadas regressão logística, Ridge, LASSO, Floresta Aleatória e
+XGBoost. 
+
+## Métricas de avaliação
+
+Foram definidas duas métricas principais:
+
+- **AUC:** avalia a capacidade geral do modelo de ordenar empresas de maior e
+  menor risco, considerando todos os pontos de corte;
+- **Sensibilidade:** indica a proporção das empresas que efetivamente deixaram
+  de operar e foram corretamente identificadas pelo modelo.
+
+O erro mais preocupante é o **falso negativo**: prever que uma empresa
+permanecerá operando quando, na realidade, ela deixará de operar. Por isso, a
+sensibilidade foi definida como critério prioritário.
+
+## Ponto de corte
+
+O corte principal de **0,20** foi estabelecido antes da comparação dos modelos.
+Optamos por um corte inferior a 0,50 como uma estratégia conservadora, na qual se
+aceita emitir mais alertas para reduzir o número de encerramentos não
+identificados.
+
+Posteriormente, `pROC::coords()` foi utilizado para mostrar como outros cortes
+entre 0,10 e 0,50 alteram sensibilidade, especificidade e precisão. 
+
+
+
+# Base de dados
+
+A base final possui `r nrow(base)` observações e
+`r ncol(base) - 1` preditoras. A variável resposta e `deixou_de_operar`, em que:
+
+- `0`: a empresa permaneceu operando;
+- `1`: a empresa deixou de operar em até dois anos.
+
+O pré-processamento em Python incluiu a criação das novas preditoras, o
+tratamento de valores ausentes, a organização das variáveis categóricas e a
+remoção de colunas redundantes ou com risco de vazamento.
+
+```{r}
+#| label: distribuicao-resposta
+#| echo: false
+
+distribuicao_resposta |>
+  mutate(
+    porcentagem = round(porcentagem, 2),
+    situacao = if_else(
+      deixou_de_operar == 1,
+      "Deixou de operar",
+      "Permaneceu operando"
+    )
+  ) |>
+  select(Situacao = situacao, Quantidade = n, Porcentagem = porcentagem) |>
+  knitr::kable(
+    caption = "Distribuição da variavel resposta",
+    align = c("l", "r", "r")
+  )
+```
+
+# Modelagem
+
+## Divisão entre treino e teste
+
+A base foi dividida em treino e teste:
+
+- **80% para treino:** ajuste dos modelos e hiperparâmetros;
+- **20% para teste:** produção das previsões e avaliação final.
+
+Utilizamos a estratificação pela variável resposta para preservar aproximadamente a mesma proporção da resposta nas
+duas amostras.
+
+```{r}
+#| label: codigo-divisao
+#| eval: false
+
+set.seed(123)
+divisao <- initial_split(
+  base,
+  prop = 0.80,
+  strata = deixou_de_operar
+)
+
+treino <- training(divisao)
+teste <- testing(divisao)
+```
+
+
+
+
+# Modelos avaliados
+
+## Regressão logística
+
+Foram ajustadas duas regressões logísticas. A primeira exclui `liquidez` e a
+segunda exclui `log_capital_de_giro`. Dessa forma, os modelos não utilizam
+simultaneamente dois indicadores construídos a partir de informações contábeis
+relacionadas e que conforme visto na análise em Python possuem uma alta correlação.
+
+```{r}
+#| label: codigo-logistica
+#| eval: false
+
+formula_logistica_sem_liquidez <-
+  deixou_de_operar ~ . - liquidez
+
+formula_logistica_sem_capital <-
+  deixou_de_operar ~ . - log_capital_de_giro
+
+modelo_logistico_sem_liquidez <- glm(
+  formula_logistica_sem_liquidez,
+  data = treino,
+  family = "binomial"
+)
+```
+
+## Ridge e LASSO
+
+Ridge e LASSO foram ajustados com `cv.glmnet()`. 
+Em ambos os casos foi utilizado `lambda.1se` para validação cruzada.
+
+```{r}
+#| label: codigo-regularizacao
+#| eval: false
+
+cv_ridge <- cv.glmnet(
+  x_treino,
+  y_treino,
+  family = "binomial",
+  alpha = 0,
+  type.measure = "auc"
+)
+
+cv_lasso <- cv.glmnet(
+  x_treino,
+  y_treino,
+  family = "binomial",
+  alpha = 1,
+  type.measure = "auc"
+)
+```
+
+## Floresta Aleatória
+
+Os hiperparâmetros `mtry` (4, 6, 8, 10) e número de árvores (100, 250, 500) foram comparados pelo erro
+*out-of-bag* (OOB), calculado somente com as observações de treino. A melhor
+configuração utilizou `r melhor_floresta$mtry` variáveis candidatas por divisão
+e `r melhor_floresta$n_arvores` árvores.
+
+```{r}
+#| label: ajuste-floresta
+#| echo: false
+
+grade_floresta |>
+  mutate(erro_oob = round(erro_oob, 4)) |>
+  arrange(erro_oob) |>
+  knitr::kable(
+    caption = "Ajuste de hiperparametros da Floresta Aleatoria",
+    col.names = c("mtry", "Numero de arvores", "Erro OOB")
+  )
+```
+
+## XGBoost
+
+O XGBoost foi ajustado com as combinações de `eta` (0.01, 0.10), `nrounds` (250, 750) e `max_depth` (1, 4)  por validação cruzada em cinco grupos dentro da base de treino.
+
+```{r}
+#| label: ajuste-xgboost
+#| echo: false
+
+resumo_xgboost |>
+  mutate(auc_media = round(auc_media, 4)) |>
+  knitr::kable(
+    caption = "Ajuste de hiperparametros do XGBoost",
+    col.names = c("eta", "Rodadas", "Profundidade", "AUC media")
+  )
+```
+
+# Resultados
+
+## Comparação das métricas
+
+```{r}
+#| label: tabela-resultados
+#| echo: false
+
+resultados_modelos |>
+  filter(modelo != "Modelo nulo") |>
+  transmute(
+    Modelo = modelo,
+    AUC = round(auc, 3),
+    Sensibilidade = round(sensibilidade, 3),
+    Especificidade = round(especificidade, 3),
+    Precisao = round(precisao, 3),
+    `Falsos negativos` = falso_negativo,
+    `Falsos positivos` = falso_positivo
+  ) |>
+  knitr::kable(
+    caption = "Desempenho na base de teste com corte 0,20"
+  )
+```
+
+O XGBoost obteve a maior AUC
+(`r sprintf("%.3f", resultado_xgboost$auc)`), enquanto a Floresta Aleatória
+obteve a maior sensibilidade
+(`r sprintf("%.3f", resultado_floresta$sensibilidade)`). A floresta deixou de
+identificar `r resultado_floresta$falso_negativo` encerramentos, contra
+`r resultado_xgboost$falso_negativo` do XGBoost.
+
+```{r}
+#| label: fig-auc
+#| echo: false
+#| fig-cap: "Comparacao dos modelos pela AUC."
+
+grafico_auc
+```
+
+```{r}
+#| label: fig-sensibilidade
+#| echo: false
+#| fig-cap: "Comparacao dos modelos pela sensibilidade no corte 0,20."
+
+grafico_sensibilidade
+```
+
+## Curvas ROC
+
+```{r}
+#| label: fig-roc
+#| echo: false
+#| fig-cap: "Curvas ROC dos modelos avaliados."
+
+grafico_roc
+```
+
+## Análise de pontos de corte
+
+O gráfico abaixo explicita o principal trade-off do problema: cortes menores
+aumentam a sensibilidade, mas reduzem a especificidade. A linha vertical marca
+o corte de 0,20 definido para a avaliação principal.
+
+```{r}
+#| label: fig-cortes
+#| echo: false
+#| fig-cap: "Sensibilidade e especificidade da Floresta Aleatoria e do XGBoost em diferentes cortes."
+
+tabela_cortes |>
+  filter(modelo %in% c("Floresta aleatoria", "XGBoost")) |>
+  select(modelo, threshold, sensitivity, specificity) |>
+  pivot_longer(
+    cols = c(sensitivity, specificity),
+    names_to = "metrica",
+    values_to = "valor"
+  ) |>
+  mutate(
+    metrica = recode(
+      metrica,
+      sensitivity = "Sensibilidade",
+      specificity = "Especificidade"
+    )
+  ) |>
+  ggplot(
+    aes(
+      x = threshold,
+      y = valor,
+      color = metrica
+    )
+  ) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(
+    xintercept = 0.20,
+    linetype = "dashed",
+    color = "grey30"
+  ) +
+  facet_wrap(~ modelo) +
+  scale_x_continuous(breaks = seq(0.10, 0.50, by = 0.05)) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    x = "Ponto de corte",
+    y = "Valor da metrica",
+    color = "Metrica"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+```{r}
+#| label: tabela-cortes-selecionados
+#| echo: false
+
+tabela_cortes |>
+  filter(
+    modelo %in% c("Floresta aleatoria", "XGBoost"),
+    threshold %in% c(0.10, 0.15, 0.20, 0.30, 0.50)
+  ) |>
+  transmute(
+    Modelo = modelo,
+    Corte = threshold,
+    Sensibilidade = round(sensitivity, 3),
+    Especificidade = round(specificity, 3),
+    Precisao = round(ppv, 3)
+  ) |>
+  knitr::kable(
+    caption = "Comparacao de cortes para os dois modelos de melhor desempenho"
+  )
+```
+
+# Interpretação do modelo selecionado
+
+A imporância por permutação da Floresta Aleatória mede quanto o desempenho do
+modelo piora quando os valores de uma preditora são embaralhados. Quanto maior
+a queda de desempenho, maior a importâcia preditiva atribuída à variável.
+
+
+```{r}
+#| label: fig-vip-floresta
+#| echo: false
+#| fig-cap: "Importancia relativa das dez principais preditoras da Floresta Aleatoria."
+
+grafico_importancia(
+  importancia_floresta,
+  "Floresta Aleatoria - importancia das preditoras"
+)
+```
+
+```{r}
+#| label: tabela-vip-floresta
+#| echo: false
+
+importancia_floresta |>
+  transmute(
+    Preditor = as.character(variavel),
+    `Importancia relativa` = round(importancia, 1)
+  ) |>
+  knitr::kable(
+    caption = "Dez principais preditoras da Floresta Aleatoria"
+  )
+```
+
+# Conclusão
+
+A **Floresta Aleatória** foi selecionada como modelo final. No corte 0,20, ela
+apresentou sensibilidade de
+`r sprintf("%.3f", resultado_floresta$sensibilidade)`, identificando
+`r resultado_floresta$verdadeiro_positivo` das
+`r resultado_floresta$verdadeiro_positivo + resultado_floresta$falso_negativo`
+empresas que deixaram de operar.
+
+O XGBoost apresentou AUC superior
+(`r sprintf("%.3f", resultado_xgboost$auc)` contra
+`r sprintf("%.3f", resultado_floresta$auc)` da floresta), demonstrando melhor
+capacidade geral de ordenar empresas por risco. Entretanto, sua sensibilidade
+foi menor (`r sprintf("%.3f", resultado_xgboost$sensibilidade)`), resultando em
+`r resultado_xgboost$falso_negativo` falsos negativos.
+
+::: {.callout-important title="Modelo selecionado"}
+A **Floresta Aleatória** foi selecionada porque apresentou a maior
+sensibilidade (`r sprintf("%.3f", resultado_floresta$sensibilidade)`) e o menor
+número de falsos negativos (`r resultado_floresta$falso_negativo`) no corte
+0,20. O XGBoost apresentou AUC maior, mas menor sensibilidade. Como o principal
+objetivo e evitar que uma empresa que fechará seja classificada como segura, a
+sensibilidade recebeu prioridade na decisão final.
+:::
+
+
+
